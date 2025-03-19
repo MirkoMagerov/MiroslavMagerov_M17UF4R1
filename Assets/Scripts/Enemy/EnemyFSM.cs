@@ -1,12 +1,14 @@
+using System.Collections;
 using UnityEngine;
 using UnityEngine.AI;
 
 public class EnemyFSM : MonoBehaviour
 {
-    public enum EnemyState { Patrol, Chase, Attack }
+    public enum EnemyState { Patrol, Chase, Attack, Flee }
     private EnemyState currentState;
     private EnemyState previousState;
     private Transform player;
+    private EnemyLife enemyLife;
 
     // Puntos de patrulla
     public Transform[] patrolPoints;
@@ -27,19 +29,36 @@ public class EnemyFSM : MonoBehaviour
     public int maxRandomPatrolAttempts = 10;
     public float minWallDistance = 2f;
     public int wallCheckRays = 8;
+    public float minDistanceBetweenPatrolPoints = 5f;
+    public bool validateNavMeshPaths = true;
+
+    // Configuración de huida
+    public float fleeDistance = 15f;
+    public float fleeUpdateInterval = 1f;
+    private float fleeTimer = 0f;
 
     private NavMeshAgent agent;
     private Vector3 lastKnownPlayerPosition;
     private bool canSeePlayer = false;
     private float lostSightTime = 0f;
     public float timeBeforeNewPatrolPoints = 5f;
+    private float originalSpeed;
 
     private void Start()
     {
+        enemyLife = GetComponent<EnemyLife>();
         player = GameObject.FindGameObjectWithTag("Player").transform;
         agent = GetComponent<NavMeshAgent>();
         currentState = EnemyState.Patrol;
         previousState = EnemyState.Patrol;
+        originalSpeed = agent.speed;
+
+        // Validar puntos de patrulla existentes
+        if (validateNavMeshPaths && patrolPoints.Length > 0)
+        {
+            ValidatePatrolPoints();
+        }
+
         MoveToNextPatrolPoint();
     }
 
@@ -79,11 +98,16 @@ public class EnemyFSM : MonoBehaviour
             case EnemyState.Attack:
                 Attack();
                 break;
+            case EnemyState.Flee:
+                Flee();
+                break;
         }
 
         // Actualizar el estado anterior y verificar transiciones
         previousState = currentState;
         CheckTransitions();
+
+        
     }
 
     private bool CanSeePlayer()
@@ -140,28 +164,167 @@ public class EnemyFSM : MonoBehaviour
         {
             agent.SetDestination(player.position);
         }
-        // Si no puede verlo pero está en modo persecución, ir a su última posición conocida
-        else if (!agent.pathPending && agent.remainingDistance < 0.5f && !usingRandomPatrolPoints)
-        {
-            // Se ha llegado a la última posición conocida del jugador
-            // Esperar a que se cumplan los segundos antes de generar puntos aleatorios
-            // (El tiempo se cuenta en Update)
-        }
     }
 
     private void Attack()
     {
-        agent.ResetPath(); // Se detiene
-        // Aquí puedes agregar la lógica de ataque
+        agent.speed = 0;
         Debug.Log("Atacando al jugador!");
+        StartCoroutine(WaitForSeconds(1f));
+        agent.speed = originalSpeed;
+    }
+
+    private IEnumerator WaitForSeconds(float seconds)
+    {
+        yield return new WaitForSeconds(seconds);
+    }
+
+    private void Flee()
+    {
+        // Actualizar la dirección de huida periódicamente
+        fleeTimer += Time.deltaTime;
+        if (fleeTimer >= fleeUpdateInterval || !agent.hasPath)
+        {
+            fleeTimer = 0f;
+
+            if (canSeePlayer)
+            {
+                // Calcular dirección opuesta al jugador
+                Vector3 fleeDirection = transform.position - player.position;
+                fleeDirection.y = 0; // Mantener en el mismo plano
+
+                // Buscar un punto de huida
+                Vector3 targetPosition = transform.position + fleeDirection.normalized * fleeDistance;
+
+                // Ajustar al NavMesh
+                NavMeshHit hit;
+                if (NavMesh.SamplePosition(targetPosition, out hit, fleeDistance, NavMesh.AllAreas))
+                {
+                    agent.SetDestination(hit.position);
+                }
+            }
+            else
+            {
+                // Si no ve al jugador, buscar un punto alejado en dirección aleatoria
+                Vector3 randomDirection = Random.insideUnitSphere * fleeDistance;
+                randomDirection.y = 0;
+                Vector3 targetPosition = transform.position + randomDirection;
+
+                NavMeshHit hit;
+                if (NavMesh.SamplePosition(targetPosition, out hit, fleeDistance, NavMesh.AllAreas))
+                {
+                    agent.SetDestination(hit.position);
+                }
+            }
+        }
+    }
+
+    // Verificar que todos los puntos de patrulla tengan rutas válidas entre ellos
+    private void ValidatePatrolPoints()
+    {
+        for (int i = 0; i < patrolPoints.Length; i++)
+        {
+            if (patrolPoints[i] == null) continue;
+
+            // Verificar ruta desde este punto al siguiente
+            int nextIndex = (i + 1) % patrolPoints.Length;
+            NavMeshPath path = new NavMeshPath();
+
+            bool validPath = NavMesh.CalculatePath(
+                patrolPoints[i].position,
+                patrolPoints[nextIndex].position,
+                NavMesh.AllAreas,
+                path
+            );
+
+            if (!validPath || path.status != NavMeshPathStatus.PathComplete)
+            {
+                Debug.LogWarning($"No valid NavMesh path between patrol points {i} and {nextIndex}!");
+            }
+        }
     }
 
     private void GenerateRandomPatrolPoints()
     {
-        for (int i = 0; i < randomPatrolPoints.Length; i++)
+        int attemptCount = 0;
+        int maxAttempts = maxRandomPatrolAttempts * 3;
+
+        // Generar el primer punto
+        randomPatrolPoints[0] = GetRandomPointOnNavMesh(lastKnownPlayerPosition, maxRandomPatrolDistance);
+
+        // Generar puntos restantes con distancia mínima
+        for (int i = 1; i < randomPatrolPoints.Length; i++)
         {
-            Vector3 randomPoint = GetRandomPointOnNavMesh(lastKnownPlayerPosition, maxRandomPatrolDistance);
-            randomPatrolPoints[i] = randomPoint;
+            Vector3 validPoint = Vector3.zero;
+            bool foundValidPoint = false;
+
+            while (!foundValidPoint && attemptCount < maxAttempts)
+            {
+                attemptCount++;
+                Vector3 candidatePoint = GetRandomPointOnNavMesh(lastKnownPlayerPosition, maxRandomPatrolDistance);
+
+                // Verificar distancia mínima entre puntos
+                bool isFarEnough = true;
+                for (int j = 0; j < i; j++)
+                {
+                    if (Vector3.Distance(candidatePoint, randomPatrolPoints[j]) < minDistanceBetweenPatrolPoints)
+                    {
+                        isFarEnough = false;
+                        break;
+                    }
+                }
+
+                // Verificar si hay ruta de NavMesh válida desde el punto anterior
+                if (isFarEnough && validateNavMeshPaths)
+                {
+                    NavMeshPath path = new NavMeshPath();
+                    if (!NavMesh.CalculatePath(randomPatrolPoints[i - 1], candidatePoint, NavMesh.AllAreas, path) ||
+                        path.status != NavMeshPathStatus.PathComplete)
+                    {
+                        isFarEnough = false;
+                    }
+                }
+
+                if (isFarEnough)
+                {
+                    validPoint = candidatePoint;
+                    foundValidPoint = true;
+                }
+            }
+
+            // Si no se encuentra punto válido, crear uno en otra dirección
+            if (!foundValidPoint)
+            {
+                // Intentar varias direcciones hasta encontrar una con camino válido
+                for (int attempt = 0; attempt < 8; attempt++)
+                {
+                    float angle = attempt * (360f / 8);
+                    Vector3 direction = Quaternion.Euler(0, angle, 0) * Vector3.forward;
+                    Vector3 targetPosition = lastKnownPlayerPosition + direction * minDistanceBetweenPatrolPoints * 1.5f;
+
+                    NavMeshHit hit;
+                    if (NavMesh.SamplePosition(targetPosition, out hit, maxRandomPatrolDistance, NavMesh.AllAreas))
+                    {
+                        NavMeshPath path = new NavMeshPath();
+                        if (!validateNavMeshPaths ||
+                            (NavMesh.CalculatePath(randomPatrolPoints[i - 1], hit.position, NavMesh.AllAreas, path) &&
+                             path.status == NavMeshPathStatus.PathComplete))
+                        {
+                            validPoint = hit.position;
+                            foundValidPoint = true;
+                            break;
+                        }
+                    }
+                }
+
+                // Si aún no hay punto válido, usar el mismo que el anterior
+                if (!foundValidPoint)
+                {
+                    validPoint = randomPatrolPoints[i - 1];
+                }
+            }
+
+            randomPatrolPoints[i] = validPoint;
         }
 
         currentRandomPatrolIndex = 0;
@@ -268,31 +431,38 @@ public class EnemyFSM : MonoBehaviour
     private void CheckTransitions()
     {
         float distanceToPlayer = Vector3.Distance(transform.position, player.position);
+        bool isHealthLow = enemyLife.IsLowHealth();
 
-        // Transiciones de estado
-        if (distanceToPlayer <= attackRange && canSeePlayer)
+        // Priorizar huida si la salud es baja y ve al jugador
+        if (isHealthLow && canSeePlayer && distanceToPlayer <= chaseRange)
+        {
+            currentState = EnemyState.Flee;
+        }
+        // Estado de ataque si está cerca y tiene salud suficiente
+        else if (distanceToPlayer <= attackRange && canSeePlayer && !isHealthLow)
         {
             currentState = EnemyState.Attack;
         }
-        else if (distanceToPlayer <= chaseRange && canSeePlayer)
+        // Estado de persecución si está en rango y tiene salud suficiente
+        else if (distanceToPlayer <= chaseRange && canSeePlayer && !isHealthLow)
         {
             currentState = EnemyState.Chase;
-            usingRandomPatrolPoints = false; // Volver a perseguir directamente
+            usingRandomPatrolPoints = false;
         }
+        // Volver a patrulla si ha perdido de vista al jugador por mucho tiempo
         else if (currentState == EnemyState.Chase &&
                  lostSightTime >= timeBeforeNewPatrolPoints &&
                  !canSeePlayer &&
                  !agent.pathPending &&
                  agent.remainingDistance < 0.5f)
         {
-            // Transición a patrulla cuando lleva mucho tiempo sin ver al jugador y ya llegó a su última posición conocida
             currentState = EnemyState.Patrol;
         }
-        else if (currentState != EnemyState.Chase && canSeePlayer && distanceToPlayer <= chaseRange)
+        // Volver a patrulla si estaba huyendo y ya no ve al jugador
+        else if (currentState == EnemyState.Flee &&
+                 (!canSeePlayer || distanceToPlayer > chaseRange * 1.5f))
         {
-            // Transición a persecución si ve al jugador y está dentro del rango
-            currentState = EnemyState.Chase;
-            usingRandomPatrolPoints = false;
+            currentState = EnemyState.Patrol;
         }
     }
 
@@ -310,62 +480,6 @@ public class EnemyFSM : MonoBehaviour
         // Dibuja el rango de visión como un cono
         Gizmos.color = canSeePlayer ? Color.green : Color.blue;
         DrawVisionCone();
-
-        // Dibuja línea de visión hacia el jugador si está en la escena
-        if (player != null)
-        {
-            Vector3 directionToPlayer = player.position - transform.position;
-            float distanceToPlayer = directionToPlayer.magnitude;
-
-            // Si puede ver al jugador
-            if (canSeePlayer)
-            {
-                Gizmos.color = Color.green;
-                Gizmos.DrawLine(transform.position, player.position);
-            }
-            // Si está dentro del rango pero no puede verlo (obstáculos)
-            else if (distanceToPlayer <= sightRange)
-            {
-                Gizmos.color = Color.red;
-                RaycastHit hit;
-                if (Physics.Raycast(transform.position, directionToPlayer.normalized, out hit, sightRange, obstacleLayers))
-                {
-                    Gizmos.DrawLine(transform.position, hit.point);
-                    // Dibujar una X en el punto de impacto
-                    float crossSize = 0.3f;
-                    Gizmos.DrawLine(hit.point + new Vector3(crossSize, crossSize, crossSize),
-                                    hit.point + new Vector3(-crossSize, -crossSize, -crossSize));
-                    Gizmos.DrawLine(hit.point + new Vector3(-crossSize, crossSize, crossSize),
-                                    hit.point + new Vector3(crossSize, -crossSize, -crossSize));
-                }
-            }
-        }
-
-        // Dibuja los puntos de patrulla aleatorios si están en uso
-        if (Application.isPlaying && usingRandomPatrolPoints)
-        {
-            // Dibuja los puntos aleatorios de patrulla
-            Gizmos.color = Color.magenta;
-            foreach (Vector3 point in randomPatrolPoints)
-            {
-                Gizmos.DrawSphere(point, 0.3f);
-
-                // Dibuja los rayos de comprobación de paredes para cada punto
-                Gizmos.color = Color.cyan;
-                for (int i = 0; i < wallCheckRays; i++)
-                {
-                    float angle = i * (360f / wallCheckRays);
-                    Vector3 direction = Quaternion.Euler(0, angle, 0) * Vector3.forward;
-                    Gizmos.DrawRay(point, direction * minWallDistance);
-                }
-            }
-
-            // Dibuja la última posición conocida del jugador
-            Gizmos.color = Color.cyan;
-            Gizmos.DrawWireSphere(lastKnownPlayerPosition, 0.5f);
-            Gizmos.DrawLine(lastKnownPlayerPosition + Vector3.up * 0.5f,
-                            lastKnownPlayerPosition + Vector3.up * 2f);
-        }
     }
 
     // Método para dibujar un cono de visión
@@ -376,7 +490,7 @@ public class EnemyFSM : MonoBehaviour
         Vector3 right = transform.right;
 
         // Número de líneas para dibujar el cono
-        int lineCount = 20;
+        int lineCount = 10;
 
         // Dibujar líneas para representar el cono
         for (int i = 0; i <= lineCount; i++)
